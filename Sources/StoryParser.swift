@@ -100,11 +100,12 @@ class StoryParser {
             guard let rightIndex = ids.firstIndex(of: right.id) else { return true }
             return leftIndex < rightIndex
         }
-        for comment in sortedTree {
+        return sortedTree.map { comment in
+            var updatedComment = comment
             // TODO: Decide whether color should be given for ones that aren't found. cdd, perhaps.
-            if let color = colors[comment.id] { comment.color = color }
-            comment.children = sortedCommentTree(original: comment.children, colors: colors)
+            if let color = colors[comment.id] { updatedComment.color = color }
+            updatedComment.children = sortedCommentTree(original: comment.children, colors: colors)
+            return updatedComment
         }
-        return sortedTree
     }
 }

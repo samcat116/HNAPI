@@ -1,6 +1,6 @@
 import Foundation
 
-public enum Content: Equatable {
+public enum Content: Equatable, Sendable, Hashable {
     case text(String)
     case url(URL)
 

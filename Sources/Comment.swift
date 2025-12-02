@@ -1,8 +1,8 @@
 import Foundation
 import SwiftSoup
 
-public class Comment: Decodable {
-    public enum Color: String, CaseIterable {
+public struct Comment: Decodable, Sendable {
+    public enum Color: String, CaseIterable, Sendable {
         case c00
         case c5a
         case c73
@@ -17,12 +17,12 @@ public class Comment: Decodable {
 
     // MARK: - Properties
 
-    public var id: Int
-    public var creation: Date
-    public var author: String
-    public var text: String
-    var isDeleted: Bool
-    public var color: Color = .c00
+    public let id: Int
+    public let creation: Date
+    public let author: String
+    public let text: String
+    let isDeleted: Bool
+    public var color: Color
     public var children: [Comment]
     public var commentCount: Int { children.reduce(1, { $0 + $1.commentCount }) }
 
@@ -36,19 +36,26 @@ public class Comment: Decodable {
         case children
     }
 
-    required public init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(Int.self, forKey: .id)
         creation = try container.decode(Date.self, forKey: .creation)
-        do {
-            text = try container.decode(String.self, forKey: .text)
-            author = try container.decode(String.self, forKey: .author)
+
+        // Handle deleted comments that may be missing text/author
+        let decodedText = try? container.decode(String.self, forKey: .text)
+        let decodedAuthor = try? container.decode(String.self, forKey: .author)
+
+        if let text = decodedText, let author = decodedAuthor {
+            self.text = text
+            self.author = author
             isDeleted = false
-        } catch {
-            text = ""
-            author = ""
+        } else {
+            self.text = ""
+            self.author = ""
             isDeleted = true
         }
+
         children = try container.decode([Comment].self, forKey: .children).filter { !$0.isDeleted }
+        color = .c00
     }
 }

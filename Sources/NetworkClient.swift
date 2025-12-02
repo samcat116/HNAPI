@@ -1,17 +1,119 @@
 import Foundation
 
-protocol NetworkClient {
-    typealias Completion = (Result<(Data, HTTPURLResponse), Error>) -> Void
+/// Configuration for retry behavior
+public struct RetryConfiguration: Sendable {
+    public let maxRetries: Int
+    public let baseDelay: TimeInterval
+    public let retryableErrors: Set<URLError.Code>
 
-    func request(to endpoint: Endpoint, completionHandler: @escaping Completion)
+    public init(
+        maxRetries: Int = 3,
+        baseDelay: TimeInterval = 0.5,
+        retryableErrors: Set<URLError.Code> = [.timedOut, .networkConnectionLost, .notConnectedToInternet]
+    ) {
+        self.maxRetries = maxRetries
+        self.baseDelay = baseDelay
+        self.retryableErrors = retryableErrors
+    }
+
+    public static let `default` = RetryConfiguration()
+}
+
+protocol NetworkClient: Sendable {
+    func request(to endpoint: Endpoint) async throws -> (Data, HTTPURLResponse)
     func request<T>(_ type: T.Type, from url: URL, decoder: JSONDecoder) async throws -> T
     where T: Decodable
-
     func string(from url: URL, token: Token?) async throws -> String
 }
 
+// MARK: - Retry Support
+
+extension NetworkClient {
+    func requestWithRetry<T>(
+        _ type: T.Type,
+        from url: URL,
+        decoder: JSONDecoder,
+        configuration: RetryConfiguration = .default
+    ) async throws -> T where T: Decodable {
+        var lastError: Error?
+
+        for attempt in 0..<configuration.maxRetries {
+            do {
+                return try await request(type, from: url, decoder: decoder)
+            } catch {
+                lastError = error
+
+                guard attempt < configuration.maxRetries - 1 else { break }
+
+                // Only retry on specific network errors
+                if let urlError = error as? URLError,
+                   configuration.retryableErrors.contains(urlError.code) {
+                    let delay = configuration.baseDelay * pow(2.0, Double(attempt))
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } else {
+                    throw error  // Non-retryable error, fail immediately
+                }
+            }
+        }
+        throw lastError ?? URLError(.unknown)
+    }
+
+    func requestWithRetry(
+        to endpoint: Endpoint,
+        configuration: RetryConfiguration = .default
+    ) async throws -> (Data, HTTPURLResponse) {
+        var lastError: Error?
+
+        for attempt in 0..<configuration.maxRetries {
+            do {
+                return try await request(to: endpoint)
+            } catch {
+                lastError = error
+
+                guard attempt < configuration.maxRetries - 1 else { break }
+
+                if let urlError = error as? URLError,
+                   configuration.retryableErrors.contains(urlError.code) {
+                    let delay = configuration.baseDelay * pow(2.0, Double(attempt))
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } else {
+                    throw error
+                }
+            }
+        }
+        throw lastError ?? URLError(.unknown)
+    }
+
+    func stringWithRetry(
+        from url: URL,
+        token: Token?,
+        configuration: RetryConfiguration = .default
+    ) async throws -> String {
+        var lastError: Error?
+
+        for attempt in 0..<configuration.maxRetries {
+            do {
+                return try await string(from: url, token: token)
+            } catch {
+                lastError = error
+
+                guard attempt < configuration.maxRetries - 1 else { break }
+
+                if let urlError = error as? URLError,
+                   configuration.retryableErrors.contains(urlError.code) {
+                    let delay = configuration.baseDelay * pow(2.0, Double(attempt))
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } else {
+                    throw error
+                }
+            }
+        }
+        throw lastError ?? URLError(.unknown)
+    }
+}
+
 extension URLSession: NetworkClient {
-    public enum HTTPError: Error, LocalizedError {
+    public enum HTTPError: Error, LocalizedError, Sendable {
         case transportError(Error)
         case serverSideError(statusCode: Int)
         case clientSideError(reason: String)
@@ -27,30 +129,15 @@ extension URLSession: NetworkClient {
         }
     }
 
-    fileprivate static func adapter(_ completionHandler: @escaping Completion) -> (
-        Data?, URLResponse?, Error?
-    ) -> Void {
-        let adapter = { (data: Data?, response: URLResponse?, error: Error?) in
-            if let data = data, let response = response as? HTTPURLResponse {
-                if response.statusCode >= 400 && response.statusCode < 500 {
-                    completionHandler(
-                        .failure(HTTPError.serverSideError(statusCode: response.statusCode)))
-                } else {
-                    completionHandler(.success((data, response)))
-                }
-            } else if let error = error {
-                completionHandler(.failure(HTTPError.transportError(error)))
-            } else {
-                preconditionFailure("Data and Error can't both be nil")
-            }
+    func request(to endpoint: Endpoint) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await data(for: endpoint)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw HTTPError.clientSideError(reason: "Invalid response type")
         }
-        return adapter
-    }
-
-    func request(to endpoint: Endpoint, completionHandler: @escaping Completion) {
-        let dataTask = self.dataTask(
-            with: endpoint, completionHandler: Self.adapter(completionHandler))
-        dataTask.resume()
+        if httpResponse.statusCode >= 400 && httpResponse.statusCode < 500 {
+            throw HTTPError.serverSideError(statusCode: httpResponse.statusCode)
+        }
+        return (data, httpResponse)
     }
 
     func request<T>(_ type: T.Type, from url: URL, decoder: JSONDecoder) async throws -> T

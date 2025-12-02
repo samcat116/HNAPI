@@ -1,6 +1,6 @@
 import Foundation
 
-public enum Action: Equatable, Hashable {
+public enum Action: Equatable, Hashable, Sendable {
     case favorite(URL)
     case unfavorite(URL)
     case upvote(URL)

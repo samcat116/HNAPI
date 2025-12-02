@@ -1,6 +1,6 @@
 import Foundation
 
-public enum Category: String {
+public enum Category: String, Sendable {
     case top = "topstories"
     case new = "newstories"
     case best = "beststories"

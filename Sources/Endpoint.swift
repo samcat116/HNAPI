@@ -5,9 +5,9 @@ typealias Endpoint = URLRequest
 // MARK: - Convenience Static Methods
 
 extension URL {
-    fileprivate static var algoliaBase = URL(string: "https://hn.algolia.com/api/v1/")!
-    fileprivate static var firebaseBase = URL(string: "https://hacker-news.firebaseio.com/v0/")!
-    fileprivate static var hnBase = URL(string: "https://news.ycombinator.com/")!
+    fileprivate static let algoliaBase = URL(string: "https://hn.algolia.com/api/v1/")!
+    fileprivate static let firebaseBase = URL(string: "https://hacker-news.firebaseio.com/v0/")!
+    fileprivate static let hnBase = URL(string: "https://news.ycombinator.com/")!
 
     static func algolia(id: Int) -> URL {
         var components = URLComponents()
@@ -40,6 +40,10 @@ extension URL {
         return firebaseBase.appendingPathComponent("\(category.rawValue).json")
     }
 
+    static func firebase(user username: String) -> URL {
+        return firebaseBase.appendingPathComponent("user/\(username).json")
+    }
+
     static func hn(id: Int) -> URL {
         var components = URLComponents()
         components.path += "item"
@@ -50,9 +54,9 @@ extension URL {
 }
 
 extension Endpoint {
-    static var algoliaBase = URL(string: "https://hn.algolia.com/api/v1/")!
-    static var firebaseBase = URL(string: "https://hacker-news.firebaseio.com/v0/")!
-    static var hnBase = URL(string: "https://news.ycombinator.com/")!
+    static let algoliaBase = URL(string: "https://hn.algolia.com/api/v1/")!
+    static let firebaseBase = URL(string: "https://hacker-news.firebaseio.com/v0/")!
+    static let hnBase = URL(string: "https://news.ycombinator.com/")!
 
     init(url: URL, token: Token) {
         var endpoint = Endpoint(url: url)

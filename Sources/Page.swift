@@ -1,6 +1,6 @@
 import Foundation
 
-public class Page {
+public struct Page: Sendable {
     // MARK: - Properties
 
     public var topLevelItem: TopLevelItem

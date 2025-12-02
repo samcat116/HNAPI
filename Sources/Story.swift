@@ -1,18 +1,18 @@
 import Foundation
 import SwiftSoup
 
-public class Story: Decodable {
+public struct Story: Decodable, Sendable, Hashable, Identifiable {
     // MARK: - Error
 
     enum Error: Swift.Error { case decodingFailed }
 
     // MARK: - Properties
 
-    public var id: Int
+    public let id: Int
     public var title: String
-    public var creation: Date
-    public var content: Content
-    public var author: String
+    public let creation: Date
+    public let content: Content
+    public let author: String
     public var points: Int
     public var commentCount: Int
 
@@ -29,7 +29,7 @@ public class Story: Decodable {
         case commentCount = "num_comments"
     }
 
-    required public init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let objectID = try container.decode(String.self, forKey: .objectID)
         guard let id = Int(objectID) else { throw Error.decodingFailed }
