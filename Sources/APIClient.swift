@@ -80,10 +80,34 @@ public actor APIClient {
 
         var fetchedItems: [TopLevelItem] = []
         if !missingIds.isEmpty {
+            // First, try the batch search endpoint (works for stories but not jobs)
             let queryResult = try await networkClient.requestWithRetry(
                 QueryResult.self, from: .algolia(ids: missingIds), decoder: decoder,
                 configuration: retryConfiguration)
             fetchedItems = queryResult.hits
+
+            // Check for any IDs still missing (likely jobs, which don't have story_<id> tags)
+            let fetchedIds = Set(fetchedItems.map { $0.id })
+            let stillMissingIds = missingIds.filter { !fetchedIds.contains($0) }
+
+            // Fetch missing items individually using /items/<id> endpoint
+            if !stillMissingIds.isEmpty {
+                let individualItems = await withTaskGroup(of: TopLevelItem?.self) { group in
+                    for id in stillMissingIds {
+                        group.addTask {
+                            try? await self.item(id: id)
+                        }
+                    }
+                    var results: [TopLevelItem] = []
+                    for await item in group {
+                        if let item = item {
+                            results.append(item)
+                        }
+                    }
+                    return results
+                }
+                fetchedItems.append(contentsOf: individualItems)
+            }
 
             // Cache the fetched items
             await cache.setItems(fetchedItems)
@@ -95,6 +119,13 @@ public actor APIClient {
         ) { _, new in new }
 
         return ids.compactMap { allItems[$0] }
+    }
+
+    /// Fetch a single item by ID using the /items/<id> endpoint
+    private func item(id: Int) async throws -> TopLevelItem {
+        return try await networkClient.requestWithRetry(
+            TopLevelItem.self, from: .algolia(id: id), decoder: decoder,
+            configuration: retryConfiguration)
     }
 
     /// Fetch items with pagination support
