@@ -109,19 +109,40 @@ extension TopLevelItem: Decodable {
 
     enum Error: Swift.Error { case decodingFailed }
 
-    enum CodingKeys: String, CodingKey { case tags = "_tags" }
+    enum CodingKeys: String, CodingKey {
+        case tags = "_tags"
+        case type
+    }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let tags = try container.decode([String].self, forKey: .tags)
-        if tags.contains("story") {
-            let story = try decoder.singleValueContainer().decode(Story.self)
-            self = .story(story)
-        } else if tags.contains("job") {
-            let job = try decoder.singleValueContainer().decode(Job.self)
-            self = .job(job)
-        } else {
-            throw Error.decodingFailed
+
+        // Try _tags first (search endpoint format)
+        if let tags = try? container.decode([String].self, forKey: .tags) {
+            if tags.contains("story") {
+                let story = try decoder.singleValueContainer().decode(Story.self)
+                self = .story(story)
+                return
+            } else if tags.contains("job") {
+                let job = try decoder.singleValueContainer().decode(Job.self)
+                self = .job(job)
+                return
+            }
         }
+
+        // Fall back to type field (items endpoint format)
+        if let type = try? container.decode(String.self, forKey: .type) {
+            if type == "story" {
+                let story = try decoder.singleValueContainer().decode(Story.self)
+                self = .story(story)
+                return
+            } else if type == "job" {
+                let job = try decoder.singleValueContainer().decode(Job.self)
+                self = .job(job)
+                return
+            }
+        }
+
+        throw Error.decodingFailed
     }
 }

@@ -15,26 +15,39 @@ public struct Job: Decodable, Sendable, Hashable, Identifiable {
     // MARK: - Decodable
 
     enum CodingKeys: String, CodingKey {
-        case objectID
+        case objectID      // search endpoint (String)
+        case id            // items endpoint (Int)
         case title
         case creation = "created_at_i"
         case url
-        case text = "story_text"
+        case storyText = "story_text"  // search endpoint
+        case text                       // items endpoint
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let objectID = try container.decode(String.self, forKey: .objectID)
-        guard let id = Int(objectID) else { throw Error.decodingFailed }
-        self.id = id
+
+        // Try objectID first (search endpoint), then id (items endpoint)
+        if let objectID = try? container.decode(String.self, forKey: .objectID),
+           let parsedId = Int(objectID) {
+            self.id = parsedId
+        } else if let directId = try? container.decode(Int.self, forKey: .id) {
+            self.id = directId
+        } else {
+            throw Error.decodingFailed
+        }
+
         title = try container.decode(String.self, forKey: .title)
         creation = try container.decode(Date.self, forKey: .creation)
+
         if let url = try? container.decode(URL.self, forKey: .url) {
             content = .url(url)
+        } else if let text = try? container.decode(String.self, forKey: .storyText) {
+            content = .text(text)
         } else if let text = try? container.decode(String.self, forKey: .text) {
             content = .text(text)
         } else {
-            // FIXME: Don't hardcode this string
+            // Fallback to HN URL
             let url = URL(string: "https://news.ycombinator.com/item?id=\(id)")!
             content = .url(url)
         }
