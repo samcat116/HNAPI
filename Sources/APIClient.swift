@@ -300,6 +300,26 @@ public actor APIClient {
         return try await items(ids: ids)
     }
 
+    // MARK: - Story Actions (Lightweight)
+
+    /// Fetches available actions for a story without loading all comments.
+    /// This is a lightweight alternative to `page(item:token:)` for when you only need voting actions.
+    public func storyActions(id: Int, token: Token) async throws -> Set<Action> {
+        let html = try await networkClient.stringWithRetry(
+            from: .hn(id: id), token: token,
+            configuration: retryConfiguration)
+        let parser = try StoryParser(html: html)
+        let actions = parser.actions()
+        return actions[id] ?? []
+    }
+
+    /// Executes an action without requiring a Page object.
+    /// Returns the updated set of actions for the item after the action is executed.
+    public func execute(action: Action, token: Token, forItemId id: Int) async throws -> Set<Action> {
+        _ = try await networkClient.request(to: Endpoint(url: action.url, token: token))
+        return action.inverseSet
+    }
+
     // MARK: - Cache Management
 
     public func clearCache() async {
