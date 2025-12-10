@@ -1,16 +1,5 @@
 import Foundation
 
-// MARK: - Array Chunking Extension
-
-private extension Array {
-    func chunked(into size: Int) -> [[Element]] {
-        guard size > 0 else { return [self] }
-        return stride(from: 0, to: count, by: size).map {
-            Array(self[$0..<Swift.min($0 + size, count)])
-        }
-    }
-}
-
 /// URLSession delegate that blocks redirects, used for login flow
 private final class RedirectBlockingDelegate: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(
@@ -45,9 +34,6 @@ public actor APIClient {
     private let decoder: JSONDecoder
     private let cache: Cache
     private let retryConfiguration: RetryConfiguration
-
-    /// Tracks in-flight item requests to prevent duplicate network calls
-    private var inFlightItems: [Int: Task<TopLevelItem, Error>] = [:]
 
     // MARK: - Init
 
@@ -105,25 +91,22 @@ public actor APIClient {
             let stillMissingIds = missingIds.filter { !fetchedIds.contains($0) }
 
             // Fetch missing items individually using /items/<id> endpoint
-            // Chunk into batches of 20 to avoid connection pool exhaustion
             if !stillMissingIds.isEmpty {
-                for chunk in stillMissingIds.chunked(into: 20) {
-                    let chunkResults = await withTaskGroup(of: TopLevelItem?.self) { group in
-                        for id in chunk {
-                            group.addTask {
-                                try? await self.item(id: id)
-                            }
+                let individualItems = await withTaskGroup(of: TopLevelItem?.self) { group in
+                    for id in stillMissingIds {
+                        group.addTask {
+                            try? await self.item(id: id)
                         }
-                        var results: [TopLevelItem] = []
-                        for await item in group {
-                            if let item = item {
-                                results.append(item)
-                            }
-                        }
-                        return results
                     }
-                    fetchedItems.append(contentsOf: chunkResults)
+                    var results: [TopLevelItem] = []
+                    for await item in group {
+                        if let item = item {
+                            results.append(item)
+                        }
+                    }
+                    return results
                 }
+                fetchedItems.append(contentsOf: individualItems)
             }
 
             // Cache the fetched items
@@ -139,29 +122,10 @@ public actor APIClient {
     }
 
     /// Fetch a single item by ID using the /items/<id> endpoint
-    /// Uses in-flight deduplication to prevent redundant network requests
     private func item(id: Int) async throws -> TopLevelItem {
-        // Check for existing in-flight request to deduplicate
-        if let existingTask = inFlightItems[id] {
-            return try await existingTask.value
-        }
-
-        // Create new task and track it
-        let task = Task {
-            try await networkClient.requestWithRetry(
-                TopLevelItem.self, from: .algolia(id: id), decoder: decoder,
-                configuration: retryConfiguration)
-        }
-        inFlightItems[id] = task
-
-        do {
-            let result = try await task.value
-            inFlightItems.removeValue(forKey: id)
-            return result
-        } catch {
-            inFlightItems.removeValue(forKey: id)
-            throw error
-        }
+        return try await networkClient.requestWithRetry(
+            TopLevelItem.self, from: .algolia(id: id), decoder: decoder,
+            configuration: retryConfiguration)
     }
 
     /// Fetch items with pagination support
@@ -174,32 +138,17 @@ public actor APIClient {
         return try await items(ids: pageIds)
     }
 
-    public func items(query: String, forceRefresh: Bool = false) async throws -> [TopLevelItem] {
-        // Check cache first
-        if !forceRefresh, let cachedResults = await cache.searchResults(for: query) {
-            return cachedResults
-        }
-
+    public func items(query: String) async throws -> [TopLevelItem] {
         let queryResult = try await networkClient.requestWithRetry(
             QueryResult.self, from: .algolia(query: query), decoder: decoder,
             configuration: retryConfiguration)
-
-        await cache.setSearchResults(queryResult.hits, for: query)
         return queryResult.hits
     }
 
-    public func itemIds(category: Category, forceRefresh: Bool = false) async throws -> [Int] {
-        // Check cache first
-        if !forceRefresh, let cachedIds = await cache.categoryIds(for: category) {
-            return cachedIds
-        }
-
-        let ids = try await networkClient.requestWithRetry(
+    public func itemIds(category: Category) async throws -> [Int] {
+        return try await networkClient.requestWithRetry(
             [Int].self, from: .firebase(category: category), decoder: decoder,
             configuration: retryConfiguration)
-
-        await cache.setCategoryIds(ids, for: category)
-        return ids
     }
 
     // MARK: - Page
@@ -227,178 +176,39 @@ public actor APIClient {
     }
 
     public func page(item: TopLevelItem, token: Token? = nil, forceRefresh: Bool = false) async throws -> Page {
-        let overallStart = CFAbsoluteTimeGetCurrent()
-
-        // Check full page cache first (only if not authenticated, as actions may change)
+        // Check cache first (only if not authenticated, as actions may change)
         if !forceRefresh && token == nil, let cachedPage = await cache.page(for: item.id) {
-            print("⏱️ [APIClient] page: full cache hit")
             return cachedPage
         }
 
-        // Check if we have cached comments (works for both authenticated and unauthenticated)
-        let cachedComments = forceRefresh ? nil : await cache.comments(for: item.id)
-        let needsComments = cachedComments == nil
-
-        // Fetch data based on what we need
-        let children: [Comment]
-        var updatedItem = item
-
-        if needsComments {
-            // Need to fetch both Algolia (comments) and HTML (actions) concurrently
-            let fetchStart = CFAbsoluteTimeGetCurrent()
-            async let algoliaItemTask = networkClient.requestWithRetry(
-                AlgoliaItem.self, from: .algolia(id: item.id), decoder: decoder,
-                configuration: retryConfiguration)
-            async let htmlTask = networkClient.stringWithRetry(
-                from: .hn(id: item.id), token: token,
-                configuration: retryConfiguration)
-            let (algoliaItem, html) = try await (algoliaItemTask, htmlTask)
-            let fetchTime = CFAbsoluteTimeGetCurrent() - fetchStart
-            print("⏱️ [APIClient] dual fetch (Algolia + HTML): \(String(format: "%.3f", fetchTime))s")
-
-            // Parse HTML with SwiftSoup
-            let parseStart = CFAbsoluteTimeGetCurrent()
-            let parser = try StoryParser(html: html)
-            let parseTime = CFAbsoluteTimeGetCurrent() - parseStart
-            print("⏱️ [APIClient] StoryParser init: \(String(format: "%.3f", parseTime))s")
-
-            // Sort comments and apply colors
-            let sortStart = CFAbsoluteTimeGetCurrent()
-            children = parser.sortedCommentTree(original: algoliaItem.children)
-            let sortTime = CFAbsoluteTimeGetCurrent() - sortStart
-            print("⏱️ [APIClient] sortedCommentTree: \(String(format: "%.3f", sortTime))s")
-
-            // Get actions
-            let actionsStart = CFAbsoluteTimeGetCurrent()
-            let actions = parser.actions()
-            let actionsTime = CFAbsoluteTimeGetCurrent() - actionsStart
-            print("⏱️ [APIClient] actions: \(String(format: "%.3f", actionsTime))s")
-
-            // Update item metadata from Algolia response
-            switch item {
-            case .job(var job):
-                job.title = algoliaItem.title
-                updatedItem = .job(job)
-            case .story(var story):
-                story.title = algoliaItem.title
-                story.points = algoliaItem.points
-                story.commentCount = algoliaItem.commentCount
-                updatedItem = .story(story)
-            }
-
-            // Cache comments separately (regardless of auth state)
-            await cache.setComments(children, for: item.id)
-
-            let page = Page(item: updatedItem, children: children, actions: actions)
-
-            // Cache full page only if not authenticated
-            if token == nil {
-                await cache.setPage(page, for: item.id)
-            }
-
-            let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
-            print("⏱️ [APIClient] page total: \(String(format: "%.3f", overallTime))s (\(children.count) top-level comments)")
-
-            return page
-        } else {
-            // Have cached comments - only need to fetch HTML for actions
-            children = cachedComments!
-
-            let fetchStart = CFAbsoluteTimeGetCurrent()
-            let html = try await networkClient.stringWithRetry(
-                from: .hn(id: item.id), token: token,
-                configuration: retryConfiguration)
-            let fetchTime = CFAbsoluteTimeGetCurrent() - fetchStart
-            print("⏱️ [APIClient] HTML fetch only: \(String(format: "%.3f", fetchTime))s")
-
-            let parseStart = CFAbsoluteTimeGetCurrent()
-            let parser = try StoryParser(html: html)
-            let parseTime = CFAbsoluteTimeGetCurrent() - parseStart
-            print("⏱️ [APIClient] StoryParser init: \(String(format: "%.3f", parseTime))s")
-
-            let actionsStart = CFAbsoluteTimeGetCurrent()
-            let actions = parser.actions()
-            let actionsTime = CFAbsoluteTimeGetCurrent() - actionsStart
-            print("⏱️ [APIClient] actions: \(String(format: "%.3f", actionsTime))s")
-
-            let page = Page(item: updatedItem, children: children, actions: actions)
-
-            // Cache full page only if not authenticated
-            if token == nil {
-                await cache.setPage(page, for: item.id)
-            }
-
-            print("⏱️ [APIClient] page (cached comments): \(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - overallStart))s")
-            return page
-        }
-    }
-
-    /// Fetches a page using only HTML parsing (no Algolia API).
-    /// This is faster as it makes a single network request instead of two.
-    /// Falls back to the regular page() method if HTML parsing fails.
-    public func pageFromHTML(item: TopLevelItem, token: Token? = nil, forceRefresh: Bool = false) async throws -> Page {
-        let overallStart = CFAbsoluteTimeGetCurrent()
-
-        // Check full page cache first (only if not authenticated, as actions may change)
-        if !forceRefresh && token == nil, let cachedPage = await cache.page(for: item.id) {
-            print("⏱️ [APIClient] pageFromHTML: cache hit")
-            return cachedPage
-        }
-
-        // Check if we have cached comments
-        if !forceRefresh, let cachedComments = await cache.comments(for: item.id) {
-            // Have cached comments - only need to fetch HTML for actions
-            let html = try await networkClient.stringWithRetry(
-                from: .hn(id: item.id), token: token,
-                configuration: retryConfiguration)
-            let parser = try StoryParser(html: html)
-            let actions = parser.actions()
-
-            let page = Page(item: item, children: cachedComments, actions: actions)
-
-            if token == nil {
-                await cache.setPage(page, for: item.id)
-            }
-
-            print("⏱️ [APIClient] pageFromHTML: comments cache hit, fetched actions only")
-            return page
-        }
-
-        // Fetch HTML and parse everything from it
-        let fetchStart = CFAbsoluteTimeGetCurrent()
+        let algoliaItem = try await networkClient.requestWithRetry(
+            AlgoliaItem.self, from: .algolia(id: item.id), decoder: decoder,
+            configuration: retryConfiguration)
         let html = try await networkClient.stringWithRetry(
             from: .hn(id: item.id), token: token,
             configuration: retryConfiguration)
-        let fetchTime = CFAbsoluteTimeGetCurrent() - fetchStart
-        print("⏱️ [APIClient] HTML fetch: \(String(format: "%.3f", fetchTime))s (\(html.count) chars)")
-
-        let parseStart = CFAbsoluteTimeGetCurrent()
         let parser = try StoryParser(html: html)
-        let parserInitTime = CFAbsoluteTimeGetCurrent() - parseStart
-        print("⏱️ [APIClient] StoryParser init (SwiftSoup): \(String(format: "%.3f", parserInitTime))s")
-
-        let commentsStart = CFAbsoluteTimeGetCurrent()
-        let children = parser.commentsFromHTML()
-        let commentsTime = CFAbsoluteTimeGetCurrent() - commentsStart
-        print("⏱️ [APIClient] commentsFromHTML: \(String(format: "%.3f", commentsTime))s (\(children.count) top-level)")
-
-        let actionsStart = CFAbsoluteTimeGetCurrent()
+        let children = parser.sortedCommentTree(original: algoliaItem.children)
         let actions = parser.actions()
-        let actionsTime = CFAbsoluteTimeGetCurrent() - actionsStart
-        print("⏱️ [APIClient] actions: \(String(format: "%.3f", actionsTime))s")
 
-        // Cache comments
-        await cache.setComments(children, for: item.id)
+        var updatedItem = item
+        switch item {
+        case .job(var job):
+            job.title = algoliaItem.title
+            updatedItem = .job(job)
+        case .story(var story):
+            story.title = algoliaItem.title
+            story.points = algoliaItem.points
+            story.commentCount = algoliaItem.commentCount
+            updatedItem = .story(story)
+        }
 
-        let page = Page(item: item, children: children, actions: actions)
+        let page = Page(item: updatedItem, children: children, actions: actions)
 
-        // Cache full page only if not authenticated
+        // Cache the page (only if not authenticated)
         if token == nil {
             await cache.setPage(page, for: item.id)
         }
-
-        let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
-        print("⏱️ [APIClient] pageFromHTML total: \(String(format: "%.3f", overallTime))s")
 
         return page
     }
