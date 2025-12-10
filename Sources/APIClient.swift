@@ -1,5 +1,16 @@
 import Foundation
 
+// MARK: - Array Chunking Extension
+
+private extension Array {
+    func chunked(into size: Int) -> [[Element]] {
+        guard size > 0 else { return [self] }
+        return stride(from: 0, to: count, by: size).map {
+            Array(self[$0..<Swift.min($0 + size, count)])
+        }
+    }
+}
+
 /// URLSession delegate that blocks redirects, used for login flow
 private final class RedirectBlockingDelegate: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(
@@ -34,6 +45,9 @@ public actor APIClient {
     private let decoder: JSONDecoder
     private let cache: Cache
     private let retryConfiguration: RetryConfiguration
+
+    /// Tracks in-flight item requests to prevent duplicate network calls
+    private var inFlightItems: [Int: Task<TopLevelItem, Error>] = [:]
 
     // MARK: - Init
 
@@ -91,22 +105,25 @@ public actor APIClient {
             let stillMissingIds = missingIds.filter { !fetchedIds.contains($0) }
 
             // Fetch missing items individually using /items/<id> endpoint
+            // Chunk into batches of 20 to avoid connection pool exhaustion
             if !stillMissingIds.isEmpty {
-                let individualItems = await withTaskGroup(of: TopLevelItem?.self) { group in
-                    for id in stillMissingIds {
-                        group.addTask {
-                            try? await self.item(id: id)
+                for chunk in stillMissingIds.chunked(into: 20) {
+                    let chunkResults = await withTaskGroup(of: TopLevelItem?.self) { group in
+                        for id in chunk {
+                            group.addTask {
+                                try? await self.item(id: id)
+                            }
                         }
-                    }
-                    var results: [TopLevelItem] = []
-                    for await item in group {
-                        if let item = item {
-                            results.append(item)
+                        var results: [TopLevelItem] = []
+                        for await item in group {
+                            if let item = item {
+                                results.append(item)
+                            }
                         }
+                        return results
                     }
-                    return results
+                    fetchedItems.append(contentsOf: chunkResults)
                 }
-                fetchedItems.append(contentsOf: individualItems)
             }
 
             // Cache the fetched items
@@ -122,10 +139,29 @@ public actor APIClient {
     }
 
     /// Fetch a single item by ID using the /items/<id> endpoint
+    /// Uses in-flight deduplication to prevent redundant network requests
     private func item(id: Int) async throws -> TopLevelItem {
-        return try await networkClient.requestWithRetry(
-            TopLevelItem.self, from: .algolia(id: id), decoder: decoder,
-            configuration: retryConfiguration)
+        // Check for existing in-flight request to deduplicate
+        if let existingTask = inFlightItems[id] {
+            return try await existingTask.value
+        }
+
+        // Create new task and track it
+        let task = Task {
+            try await networkClient.requestWithRetry(
+                TopLevelItem.self, from: .algolia(id: id), decoder: decoder,
+                configuration: retryConfiguration)
+        }
+        inFlightItems[id] = task
+
+        do {
+            let result = try await task.value
+            inFlightItems.removeValue(forKey: id)
+            return result
+        } catch {
+            inFlightItems.removeValue(forKey: id)
+            throw error
+        }
     }
 
     /// Fetch items with pagination support
@@ -138,17 +174,32 @@ public actor APIClient {
         return try await items(ids: pageIds)
     }
 
-    public func items(query: String) async throws -> [TopLevelItem] {
+    public func items(query: String, forceRefresh: Bool = false) async throws -> [TopLevelItem] {
+        // Check cache first
+        if !forceRefresh, let cachedResults = await cache.searchResults(for: query) {
+            return cachedResults
+        }
+
         let queryResult = try await networkClient.requestWithRetry(
             QueryResult.self, from: .algolia(query: query), decoder: decoder,
             configuration: retryConfiguration)
+
+        await cache.setSearchResults(queryResult.hits, for: query)
         return queryResult.hits
     }
 
-    public func itemIds(category: Category) async throws -> [Int] {
-        return try await networkClient.requestWithRetry(
+    public func itemIds(category: Category, forceRefresh: Bool = false) async throws -> [Int] {
+        // Check cache first
+        if !forceRefresh, let cachedIds = await cache.categoryIds(for: category) {
+            return cachedIds
+        }
+
+        let ids = try await networkClient.requestWithRetry(
             [Int].self, from: .firebase(category: category), decoder: decoder,
             configuration: retryConfiguration)
+
+        await cache.setCategoryIds(ids, for: category)
+        return ids
     }
 
     // MARK: - Page
@@ -176,41 +227,75 @@ public actor APIClient {
     }
 
     public func page(item: TopLevelItem, token: Token? = nil, forceRefresh: Bool = false) async throws -> Page {
-        // Check cache first (only if not authenticated, as actions may change)
+        // Check full page cache first (only if not authenticated, as actions may change)
         if !forceRefresh && token == nil, let cachedPage = await cache.page(for: item.id) {
             return cachedPage
         }
 
-        let algoliaItem = try await networkClient.requestWithRetry(
-            AlgoliaItem.self, from: .algolia(id: item.id), decoder: decoder,
-            configuration: retryConfiguration)
-        let html = try await networkClient.stringWithRetry(
-            from: .hn(id: item.id), token: token,
-            configuration: retryConfiguration)
-        let parser = try StoryParser(html: html)
-        let children = parser.sortedCommentTree(original: algoliaItem.children)
-        let actions = parser.actions()
+        // Check if we have cached comments (works for both authenticated and unauthenticated)
+        let cachedComments = forceRefresh ? nil : await cache.comments(for: item.id)
+        let needsComments = cachedComments == nil
 
+        // Fetch data based on what we need
+        let children: [Comment]
         var updatedItem = item
-        switch item {
-        case .job(var job):
-            job.title = algoliaItem.title
-            updatedItem = .job(job)
-        case .story(var story):
-            story.title = algoliaItem.title
-            story.points = algoliaItem.points
-            story.commentCount = algoliaItem.commentCount
-            updatedItem = .story(story)
+
+        if needsComments {
+            // Need to fetch both Algolia (comments) and HTML (actions) concurrently
+            async let algoliaItemTask = networkClient.requestWithRetry(
+                AlgoliaItem.self, from: .algolia(id: item.id), decoder: decoder,
+                configuration: retryConfiguration)
+            async let htmlTask = networkClient.stringWithRetry(
+                from: .hn(id: item.id), token: token,
+                configuration: retryConfiguration)
+            let (algoliaItem, html) = try await (algoliaItemTask, htmlTask)
+
+            let parser = try StoryParser(html: html)
+            children = parser.sortedCommentTree(original: algoliaItem.children)
+            let actions = parser.actions()
+
+            // Update item metadata from Algolia response
+            switch item {
+            case .job(var job):
+                job.title = algoliaItem.title
+                updatedItem = .job(job)
+            case .story(var story):
+                story.title = algoliaItem.title
+                story.points = algoliaItem.points
+                story.commentCount = algoliaItem.commentCount
+                updatedItem = .story(story)
+            }
+
+            // Cache comments separately (regardless of auth state)
+            await cache.setComments(children, for: item.id)
+
+            let page = Page(item: updatedItem, children: children, actions: actions)
+
+            // Cache full page only if not authenticated
+            if token == nil {
+                await cache.setPage(page, for: item.id)
+            }
+
+            return page
+        } else {
+            // Have cached comments - only need to fetch HTML for actions
+            children = cachedComments!
+
+            let html = try await networkClient.stringWithRetry(
+                from: .hn(id: item.id), token: token,
+                configuration: retryConfiguration)
+            let parser = try StoryParser(html: html)
+            let actions = parser.actions()
+
+            let page = Page(item: updatedItem, children: children, actions: actions)
+
+            // Cache full page only if not authenticated
+            if token == nil {
+                await cache.setPage(page, for: item.id)
+            }
+
+            return page
         }
-
-        let page = Page(item: updatedItem, children: children, actions: actions)
-
-        // Cache the page (only if not authenticated)
-        if token == nil {
-            await cache.setPage(page, for: item.id)
-        }
-
-        return page
     }
 
     /// Executes an action and returns an updated Page with modified actions

@@ -8,12 +8,26 @@ public actor Cache {
         public let maxItems: Int
         public let maxPages: Int
         public let maxUsers: Int
+        public let maxCategories: Int
+        public let maxSearchResults: Int
+        public let maxCommentTrees: Int
         public let ttl: TimeInterval?
 
-        public init(maxItems: Int = 200, maxPages: Int = 50, maxUsers: Int = 50, ttl: TimeInterval? = 300) {
+        public init(
+            maxItems: Int = 200,
+            maxPages: Int = 50,
+            maxUsers: Int = 50,
+            maxCategories: Int = 10,
+            maxSearchResults: Int = 20,
+            maxCommentTrees: Int = 50,
+            ttl: TimeInterval? = 300
+        ) {
             self.maxItems = maxItems
             self.maxPages = maxPages
             self.maxUsers = maxUsers
+            self.maxCategories = maxCategories
+            self.maxSearchResults = maxSearchResults
+            self.maxCommentTrees = maxCommentTrees
             self.ttl = ttl
         }
 
@@ -41,6 +55,12 @@ public actor Cache {
     private var pageAccessOrder: [Int] = []
     private var users: [String: Entry<User>] = [:]
     private var userAccessOrder: [String] = []
+    private var categoryIds: [Category: Entry<[Int]>] = [:]
+    private var categoryAccessOrder: [Category] = []
+    private var searchResults: [String: Entry<[TopLevelItem]>] = [:]
+    private var searchAccessOrder: [String] = []
+    private var commentTrees: [Int: Entry<[Comment]>] = [:]
+    private var commentTreeAccessOrder: [Int] = []
 
     // MARK: - Init
 
@@ -116,6 +136,57 @@ public actor Cache {
         evictIfNeeded(cache: &users, order: &userAccessOrder, maxSize: configuration.maxUsers)
     }
 
+    // MARK: - Category IDs
+
+    public func categoryIds(for category: Category) -> [Int]? {
+        guard let entry = categoryIds[category], entry.isValid(ttl: configuration.ttl) else {
+            categoryIds.removeValue(forKey: category)
+            return nil
+        }
+        updateAccessOrder(id: category, in: &categoryAccessOrder)
+        return entry.value
+    }
+
+    public func setCategoryIds(_ ids: [Int], for category: Category) {
+        categoryIds[category] = Entry(value: ids, timestamp: Date())
+        updateAccessOrder(id: category, in: &categoryAccessOrder)
+        evictIfNeeded(cache: &categoryIds, order: &categoryAccessOrder, maxSize: configuration.maxCategories)
+    }
+
+    // MARK: - Search Results
+
+    public func searchResults(for query: String) -> [TopLevelItem]? {
+        guard let entry = searchResults[query], entry.isValid(ttl: configuration.ttl) else {
+            searchResults.removeValue(forKey: query)
+            return nil
+        }
+        updateAccessOrder(id: query, in: &searchAccessOrder)
+        return entry.value
+    }
+
+    public func setSearchResults(_ items: [TopLevelItem], for query: String) {
+        searchResults[query] = Entry(value: items, timestamp: Date())
+        updateAccessOrder(id: query, in: &searchAccessOrder)
+        evictIfNeeded(cache: &searchResults, order: &searchAccessOrder, maxSize: configuration.maxSearchResults)
+    }
+
+    // MARK: - Comment Trees
+
+    public func comments(for itemId: Int) -> [Comment]? {
+        guard let entry = commentTrees[itemId], entry.isValid(ttl: configuration.ttl) else {
+            commentTrees.removeValue(forKey: itemId)
+            return nil
+        }
+        updateAccessOrder(id: itemId, in: &commentTreeAccessOrder)
+        return entry.value
+    }
+
+    public func setComments(_ comments: [Comment], for itemId: Int) {
+        commentTrees[itemId] = Entry(value: comments, timestamp: Date())
+        updateAccessOrder(id: itemId, in: &commentTreeAccessOrder)
+        evictIfNeeded(cache: &commentTrees, order: &commentTreeAccessOrder, maxSize: configuration.maxCommentTrees)
+    }
+
     // MARK: - Clear
 
     public func clear() {
@@ -125,6 +196,12 @@ public actor Cache {
         pageAccessOrder.removeAll()
         users.removeAll()
         userAccessOrder.removeAll()
+        categoryIds.removeAll()
+        categoryAccessOrder.removeAll()
+        searchResults.removeAll()
+        searchAccessOrder.removeAll()
+        commentTrees.removeAll()
+        commentTreeAccessOrder.removeAll()
     }
 
     // MARK: - Private Helpers
