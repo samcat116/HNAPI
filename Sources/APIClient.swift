@@ -302,8 +302,11 @@ public actor APIClient {
     /// This is faster as it makes a single network request instead of two.
     /// Falls back to the regular page() method if HTML parsing fails.
     public func pageFromHTML(item: TopLevelItem, token: Token? = nil, forceRefresh: Bool = false) async throws -> Page {
+        let overallStart = CFAbsoluteTimeGetCurrent()
+
         // Check full page cache first (only if not authenticated, as actions may change)
         if !forceRefresh && token == nil, let cachedPage = await cache.page(for: item.id) {
+            print("⏱️ [APIClient] pageFromHTML: cache hit")
             return cachedPage
         }
 
@@ -322,17 +325,32 @@ public actor APIClient {
                 await cache.setPage(page, for: item.id)
             }
 
+            print("⏱️ [APIClient] pageFromHTML: comments cache hit, fetched actions only")
             return page
         }
 
         // Fetch HTML and parse everything from it
+        let fetchStart = CFAbsoluteTimeGetCurrent()
         let html = try await networkClient.stringWithRetry(
             from: .hn(id: item.id), token: token,
             configuration: retryConfiguration)
+        let fetchTime = CFAbsoluteTimeGetCurrent() - fetchStart
+        print("⏱️ [APIClient] HTML fetch: \(String(format: "%.3f", fetchTime))s (\(html.count) chars)")
 
+        let parseStart = CFAbsoluteTimeGetCurrent()
         let parser = try StoryParser(html: html)
+        let parserInitTime = CFAbsoluteTimeGetCurrent() - parseStart
+        print("⏱️ [APIClient] StoryParser init (SwiftSoup): \(String(format: "%.3f", parserInitTime))s")
+
+        let commentsStart = CFAbsoluteTimeGetCurrent()
         let children = parser.commentsFromHTML()
+        let commentsTime = CFAbsoluteTimeGetCurrent() - commentsStart
+        print("⏱️ [APIClient] commentsFromHTML: \(String(format: "%.3f", commentsTime))s (\(children.count) top-level)")
+
+        let actionsStart = CFAbsoluteTimeGetCurrent()
         let actions = parser.actions()
+        let actionsTime = CFAbsoluteTimeGetCurrent() - actionsStart
+        print("⏱️ [APIClient] actions: \(String(format: "%.3f", actionsTime))s")
 
         // Cache comments
         await cache.setComments(children, for: item.id)
@@ -343,6 +361,9 @@ public actor APIClient {
         if token == nil {
             await cache.setPage(page, for: item.id)
         }
+
+        let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
+        print("⏱️ [APIClient] pageFromHTML total: \(String(format: "%.3f", overallTime))s")
 
         return page
     }
