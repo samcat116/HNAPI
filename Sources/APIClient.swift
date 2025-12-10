@@ -227,8 +227,11 @@ public actor APIClient {
     }
 
     public func page(item: TopLevelItem, token: Token? = nil, forceRefresh: Bool = false) async throws -> Page {
+        let overallStart = CFAbsoluteTimeGetCurrent()
+
         // Check full page cache first (only if not authenticated, as actions may change)
         if !forceRefresh && token == nil, let cachedPage = await cache.page(for: item.id) {
+            print("⏱️ [APIClient] page: full cache hit")
             return cachedPage
         }
 
@@ -242,6 +245,7 @@ public actor APIClient {
 
         if needsComments {
             // Need to fetch both Algolia (comments) and HTML (actions) concurrently
+            let fetchStart = CFAbsoluteTimeGetCurrent()
             async let algoliaItemTask = networkClient.requestWithRetry(
                 AlgoliaItem.self, from: .algolia(id: item.id), decoder: decoder,
                 configuration: retryConfiguration)
@@ -249,10 +253,21 @@ public actor APIClient {
                 from: .hn(id: item.id), token: token,
                 configuration: retryConfiguration)
             let (algoliaItem, html) = try await (algoliaItemTask, htmlTask)
+            let fetchTime = CFAbsoluteTimeGetCurrent() - fetchStart
+            print("⏱️ [APIClient] dual fetch (Algolia + HTML): \(String(format: "%.3f", fetchTime))s")
 
-            let parser = try StoryParser(html: html)
-            children = parser.sortedCommentTree(original: algoliaItem.children)
-            let actions = parser.actions()
+            // Use regex-based action parsing (much faster than SwiftSoup)
+            let actionsStart = CFAbsoluteTimeGetCurrent()
+            let actions = Self.parseActionsWithRegex(html: html)
+            let actionsTime = CFAbsoluteTimeGetCurrent() - actionsStart
+            print("⏱️ [APIClient] parseActionsWithRegex: \(String(format: "%.3f", actionsTime))s")
+
+            // Sort comments and apply colors using regex
+            let sortStart = CFAbsoluteTimeGetCurrent()
+            let (commentOrder, commentColors) = Self.parseCommentMetadataWithRegex(html: html)
+            children = Self.sortCommentTree(original: algoliaItem.children, order: commentOrder, colors: commentColors)
+            let sortTime = CFAbsoluteTimeGetCurrent() - sortStart
+            print("⏱️ [APIClient] sort + colors: \(String(format: "%.3f", sortTime))s")
 
             // Update item metadata from Algolia response
             switch item {
@@ -276,16 +291,25 @@ public actor APIClient {
                 await cache.setPage(page, for: item.id)
             }
 
+            let overallTime = CFAbsoluteTimeGetCurrent() - overallStart
+            print("⏱️ [APIClient] page total: \(String(format: "%.3f", overallTime))s (\(children.count) top-level comments)")
+
             return page
         } else {
             // Have cached comments - only need to fetch HTML for actions
             children = cachedComments!
 
+            let fetchStart = CFAbsoluteTimeGetCurrent()
             let html = try await networkClient.stringWithRetry(
                 from: .hn(id: item.id), token: token,
                 configuration: retryConfiguration)
-            let parser = try StoryParser(html: html)
-            let actions = parser.actions()
+            let fetchTime = CFAbsoluteTimeGetCurrent() - fetchStart
+            print("⏱️ [APIClient] HTML fetch only: \(String(format: "%.3f", fetchTime))s")
+
+            let actionsStart = CFAbsoluteTimeGetCurrent()
+            let actions = Self.parseActionsWithRegex(html: html)
+            let actionsTime = CFAbsoluteTimeGetCurrent() - actionsStart
+            print("⏱️ [APIClient] parseActionsWithRegex: \(String(format: "%.3f", actionsTime))s")
 
             let page = Page(item: updatedItem, children: children, actions: actions)
 
@@ -294,7 +318,151 @@ public actor APIClient {
                 await cache.setPage(page, for: item.id)
             }
 
+            print("⏱️ [APIClient] page (cached comments): \(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - overallStart))s")
             return page
+        }
+    }
+
+    // MARK: - Regex-based Parsing (faster than SwiftSoup)
+
+    /// Parse vote actions using regex instead of SwiftSoup DOM parsing
+    private static func parseActionsWithRegex(html: String) -> [Int: Set<Action>] {
+        var actions: [Int: Set<Action>] = [:]
+        let base = URL(string: "https://news.ycombinator.com")!
+
+        // Match vote links: <a id='up_12345' href='vote?id=12345&how=up&auth=xxx&goto=...'><div class='votearrow' title='upvote'></div></a>
+        // Also match downvote links
+        let votePattern = #"<a\s+id='(up|down)_(\d+)'\s+href='(vote\?[^']+)'[^>]*>.*?title='(upvote|downvote)'"#
+        let voteRegex = try? NSRegularExpression(pattern: votePattern, options: [.dotMatchesLineSeparators])
+
+        if let regex = voteRegex {
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, range: range)
+
+            for match in matches {
+                guard match.numberOfRanges >= 5,
+                      let idRange = Range(match.range(at: 2), in: html),
+                      let hrefRange = Range(match.range(at: 3), in: html),
+                      let titleRange = Range(match.range(at: 4), in: html) else { continue }
+
+                let id = Int(html[idRange]) ?? 0
+                var href = String(html[hrefRange])
+                let title = String(html[titleRange])
+
+                // Clean up href - remove goto parameter
+                if var components = URLComponents(string: href) {
+                    components.queryItems?.removeAll(where: { $0.name == "goto" })
+                    if let url = components.url(relativeTo: base) {
+                        let action: Action? = switch title {
+                        case "upvote": .upvote(url)
+                        case "downvote": .downvote(url)
+                        default: nil
+                        }
+                        if let action = action {
+                            actions[id, default: []].insert(action)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Match unvote/undown links: <a id="unv_12345" ...><a href='vote?...'>unvote</a></a>
+        let unvotePattern = #"<span\s+id="unv_(\d+)"[^>]*>.*?<a\s+href='([^']+)'[^>]*>(unvote|undown)</a>"#
+        let unvoteRegex = try? NSRegularExpression(pattern: unvotePattern, options: [.dotMatchesLineSeparators])
+
+        if let regex = unvoteRegex {
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, range: range)
+
+            for match in matches {
+                guard match.numberOfRanges >= 4,
+                      let idRange = Range(match.range(at: 1), in: html),
+                      let hrefRange = Range(match.range(at: 2), in: html),
+                      let textRange = Range(match.range(at: 3), in: html) else { continue }
+
+                let id = Int(html[idRange]) ?? 0
+                let href = String(html[hrefRange])
+                let text = String(html[textRange])
+
+                if let url = URL(string: href, relativeTo: base) {
+                    let action: Action? = switch text {
+                    case "unvote": .unvote(url)
+                    case "undown": .undown(url)
+                    default: nil
+                    }
+                    if let action = action {
+                        actions[id, default: []].insert(action)
+                    }
+                }
+            }
+        }
+
+        return actions
+    }
+
+    /// Parse comment order and colors using regex
+    private static func parseCommentMetadataWithRegex(html: String) -> (order: [Int], colors: [Int: Comment.Color]) {
+        var order: [Int] = []
+        var colors: [Int: Comment.Color] = [:]
+
+        // Match comment rows: <tr class='athing comtr' id='12345'>
+        let commentPattern = #"<tr\s+class='athing\s+comtr'\s+id='(\d+)'"#
+        let commentRegex = try? NSRegularExpression(pattern: commentPattern, options: [])
+
+        if let regex = commentRegex {
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, range: range)
+
+            for match in matches {
+                guard match.numberOfRanges >= 2,
+                      let idRange = Range(match.range(at: 1), in: html),
+                      let id = Int(html[idRange]) else { continue }
+                order.append(id)
+            }
+        }
+
+        // Match comment colors: <span class="commtext c73"> or similar
+        let colorPattern = #"<span\s+class="commtext\s+(c[0-9a-f]{2})"[^>]*>.*?</span>.*?id='(\d+)'"#
+        // This pattern is tricky because color appears before the ID in the HTML
+        // Let's try a different approach - find commtext with color class near an ID
+
+        // Simpler approach: for each comment ID, search for its color class nearby
+        let colorClassPattern = #"id='(\d+)'.*?class="commtext\s*(c[0-9a-f]{2})?"#
+        let colorRegex = try? NSRegularExpression(pattern: colorClassPattern, options: [.dotMatchesLineSeparators])
+
+        // Actually, let's search for color classes followed by looking back for the comment ID
+        // The structure is: <tr id='XXX'>...<span class="commtext cYY">
+        for id in order {
+            // Find the comment row and look for color class within it
+            let rowPattern = #"id='\#(id)'.*?class="commtext\s*(c[0-9a-f]{2})?"#
+            if let rowRegex = try? NSRegularExpression(pattern: rowPattern, options: [.dotMatchesLineSeparators]) {
+                let range = NSRange(html.startIndex..., in: html)
+                if let match = rowRegex.firstMatch(in: html, range: range),
+                   match.numberOfRanges >= 2,
+                   let colorRange = Range(match.range(at: 2), in: html) {
+                    let colorStr = String(html[colorRange])
+                    if let color = Comment.Color(rawValue: colorStr) {
+                        colors[id] = color
+                    }
+                }
+            }
+        }
+
+        return (order, colors)
+    }
+
+    /// Sort comment tree using pre-computed order and apply colors
+    private static func sortCommentTree(original: [Comment], order: [Int], colors: [Int: Comment.Color]) -> [Comment] {
+        let sortedTree = original.sorted { left, right in
+            guard let leftIndex = order.firstIndex(of: left.id) else { return false }
+            guard let rightIndex = order.firstIndex(of: right.id) else { return true }
+            return leftIndex < rightIndex
+        }
+        return sortedTree.map { comment in
+            var updatedComment = comment
+            if let color = colors[comment.id] { updatedComment.color = color }
+            updatedComment.children = sortCommentTree(original: comment.children, order: order, colors: colors)
+            return updatedComment
         }
     }
 
