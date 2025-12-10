@@ -298,6 +298,55 @@ public actor APIClient {
         }
     }
 
+    /// Fetches a page using only HTML parsing (no Algolia API).
+    /// This is faster as it makes a single network request instead of two.
+    /// Falls back to the regular page() method if HTML parsing fails.
+    public func pageFromHTML(item: TopLevelItem, token: Token? = nil, forceRefresh: Bool = false) async throws -> Page {
+        // Check full page cache first (only if not authenticated, as actions may change)
+        if !forceRefresh && token == nil, let cachedPage = await cache.page(for: item.id) {
+            return cachedPage
+        }
+
+        // Check if we have cached comments
+        if !forceRefresh, let cachedComments = await cache.comments(for: item.id) {
+            // Have cached comments - only need to fetch HTML for actions
+            let html = try await networkClient.stringWithRetry(
+                from: .hn(id: item.id), token: token,
+                configuration: retryConfiguration)
+            let parser = try StoryParser(html: html)
+            let actions = parser.actions()
+
+            let page = Page(item: item, children: cachedComments, actions: actions)
+
+            if token == nil {
+                await cache.setPage(page, for: item.id)
+            }
+
+            return page
+        }
+
+        // Fetch HTML and parse everything from it
+        let html = try await networkClient.stringWithRetry(
+            from: .hn(id: item.id), token: token,
+            configuration: retryConfiguration)
+
+        let parser = try StoryParser(html: html)
+        let children = parser.commentsFromHTML()
+        let actions = parser.actions()
+
+        // Cache comments
+        await cache.setComments(children, for: item.id)
+
+        let page = Page(item: item, children: children, actions: actions)
+
+        // Cache full page only if not authenticated
+        if token == nil {
+            await cache.setPage(page, for: item.id)
+        }
+
+        return page
+    }
+
     /// Executes an action and returns an updated Page with modified actions
     @discardableResult
     public func execute(action: Action, token: Token, page: Page) async throws -> Page {

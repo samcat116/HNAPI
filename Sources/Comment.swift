@@ -26,6 +26,18 @@ public struct Comment: Decodable, Sendable {
     public var children: [Comment]
     public var commentCount: Int { children.reduce(1, { $0 + $1.commentCount }) }
 
+    // MARK: - Internal Init (for HTML parsing)
+
+    init(id: Int, creation: Date, author: String, text: String, color: Color = .c00, children: [Comment] = []) {
+        self.id = id
+        self.creation = creation
+        self.author = author
+        self.text = text
+        self.isDeleted = false
+        self.color = color
+        self.children = children
+    }
+
     // MARK: - Decodable
 
     enum CodingKeys: String, CodingKey {
